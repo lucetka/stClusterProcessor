@@ -5,11 +5,28 @@
 
 ## sparse-safe with removed (2,3) option
 
-## after co-pilot implemented a chatGPT strategy which was overengineered and didn't work
-### I forced him to use my old strategy from my code bits from my old Jupyter notebooks which now seems to work
-### this _apple version is a copy of copilots outputted stClusterProcessor_notebook_mode.py which was based on _garlic_patched.py
+## I gave Copilot my old functions and code bits from Jupyter notebooks that I had successfully been using to
+## label and comment on clusters using chatGPT API - Howeover, Copilot decided to ignore my strategy and implemented a chatGPT
+## strategy which was overengineered and didn't work AT ALL. 
+### I forced him to use my old functions and code bits from my old Jupyter notebooks which now seems to work
 
+###  _apple version was a copy of copilots outputted stClusterProcessor_notebook_mode.py which was based on _garlic_patched.py
 
+### this _banana version is a copy of manually edited/patched version of copilot-outputted stClusterProcessor_apple_persist.py 
+### which featured persisting labels
+#### 
+### the only new feature in _banana as compared to stClusterProcessor_apple_persist.py
+### is the implementation of download button on the 2D plot chart
+####################
+### NEXT important to-dos in no particular order:
+## - highest priority: accomodate multiple clusterings
+## - modularize prompts - yaml
+## - let user select unclustered
+## - export results packaged
+## - improve sampling
+## - add columns to chart - partially done
+##
+####
 
 import streamlit as st
 import pandas as pd
@@ -24,12 +41,150 @@ import os
 import json
 import time
 import re
+import hashlib
 
 # OpenAI client (optional; only needed for GPT labeling strategy)
 try:
     from openai import OpenAI
 except Exception:  # pragma: no cover
     OpenAI = None
+
+
+#st.write("compute_data_id exists?", "compute_data_id" in globals())
+
+import hashlib
+
+# --------------------
+# Label persistence helpers (session_state)
+# --------------------
+
+def compute_data_id(file_bytes: bytes, filename: str) -> str:
+    """Lightweight fingerprint for the uploaded dataset."""
+    sample = file_bytes[:1_000_000] if file_bytes else b""
+    h = hashlib.md5()
+    h.update((filename or "").encode("utf-8", errors="ignore"))
+    h.update(str(len(file_bytes) if file_bytes is not None else 0).encode("utf-8"))
+    h.update(sample)
+    return h.hexdigest()
+
+def init_label_store(data_id: str):
+    """Initialize (or reset) label store if a new dataset is uploaded."""
+    store = st.session_state.get("label_store")
+    if (store is None) or (store.get("data_id") != data_id):
+        st.session_state["label_store"] = {"data_id": data_id, "by_cluster_col": {}}
+
+def _ensure_cluster_bucket(cluster_col: str) -> dict:
+    store = st.session_state.get("label_store", {})
+    store.setdefault("by_cluster_col", {})
+    store["by_cluster_col"].setdefault(cluster_col, {})
+    st.session_state["label_store"] = store
+    return store["by_cluster_col"][cluster_col]
+
+def store_ctfidf_labels(cluster_col: str, keyword_map: dict):
+    bucket = _ensure_cluster_bucket(cluster_col)
+    bucket["ctfidf"] = {str(k): ("" if v is None else str(v)) for k, v in (keyword_map or {}).items()}
+
+def store_gpt_labels(cluster_col: str, labels_df: pd.DataFrame):
+    bucket = _ensure_cluster_bucket(cluster_col)
+    if labels_df is None or labels_df.empty or "Cluster" not in labels_df.columns:
+        return
+
+    tmp = labels_df.copy()
+    tmp["Cluster"] = tmp["Cluster"].astype(str)
+
+    def _col_to_map(colname: str) -> dict:
+        if colname not in tmp.columns:
+            return {}
+        return (
+            tmp.set_index("Cluster")[colname]
+            .astype(str)
+            .replace({"<NA>": "", "nan": "", "None": ""})
+            .to_dict()
+        )
+
+    bucket["gpt_summary"] = _col_to_map("Summary label")
+    bucket["gpt_keywords"] = _col_to_map("Keywords")
+    bucket["gpt_homogeneity"] = _col_to_map("Homogeneity/Diversity")
+    bucket["gpt_subclusters"] = _col_to_map("Subclusters")
+    bucket["gpt_df"] = tmp
+
+def get_persisted_label_columns(cluster_col: str) -> list:
+    """Which persisted label/enrichment columns are currently available?"""
+    store = st.session_state.get("label_store", {})
+    bucket = store.get("by_cluster_col", {}).get(cluster_col, {})
+    cols = []
+    if bucket.get("ctfidf"):
+        cols.append("cTF-IDF keywords")
+    if bucket.get("gpt_summary"):
+        cols.extend(["Summary label", "Keywords", "Homogeneity/Diversity", "Subclusters"])
+    # unique preserving order
+    seen, out = set(), []
+    for c in cols:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+def enrich_df_with_labels(df_in: pd.DataFrame, cluster_col: str) -> pd.DataFrame:
+    """Append persisted labeling outputs as columns onto df_in."""
+    if df_in is None or df_in.empty or cluster_col not in df_in.columns:
+        return df_in
+
+    store = st.session_state.get("label_store", {})
+    bucket = store.get("by_cluster_col", {}).get(cluster_col, {})
+    if not bucket:
+        return df_in
+
+    df = df_in.copy()
+    cid = df[cluster_col].astype(str)
+
+    if bucket.get("ctfidf"):
+        df["cTF-IDF keywords"] = cid.map(bucket.get("ctfidf", {})).fillna("")
+
+    if bucket.get("gpt_summary"):
+        df["Summary label"] = cid.map(bucket.get("gpt_summary", {})).fillna("")
+        df["Keywords"] = cid.map(bucket.get("gpt_keywords", {})).fillna("")
+        df["Homogeneity/Diversity"] = cid.map(bucket.get("gpt_homogeneity", {})).fillna("")
+        df["Subclusters"] = cid.map(bucket.get("gpt_subclusters", {})).fillna("")
+
+    return df
+
+def _shorten_text(val: str, max_len: int) -> str:
+    s = "" if val is None else str(val)
+    s = re.sub(r"\s+", " ", s).strip()
+    if max_len and len(s) > max_len:
+        return s[: max_len - 1] + "…"
+    return s
+
+def add_enriched_legend_column(df_in: pd.DataFrame, cluster_col: str, legend_style: str, max_len: int = 80) -> pd.DataFrame:
+    """Create __legend__ column combining cluster id + persisted labels."""
+    if df_in is None or df_in.empty or cluster_col not in df_in.columns:
+        return df_in
+
+    store = st.session_state.get("label_store", {})
+    bucket = store.get("by_cluster_col", {}).get(cluster_col, {})
+    ctfidf_map = bucket.get("ctfidf", {})
+    gpt_sum_map = bucket.get("gpt_summary", {})
+
+    uniq = df_in[cluster_col].astype(str).dropna().unique().tolist()
+    legend_map = {}
+
+    for cid in uniq:
+        parts = []
+        if "cTF-IDF" in legend_style and ctfidf_map:
+            kw = _shorten_text(ctfidf_map.get(str(cid), ""), max_len)
+            if kw:
+                parts.append(f"cTF-IDF: {kw}")
+        if "GPT" in legend_style and gpt_sum_map:
+            sm = _shorten_text(gpt_sum_map.get(str(cid), ""), max_len)
+            if sm:
+                parts.append(f"GPT: {sm}")
+
+        legend_map[str(cid)] = (str(cid) + "<br>" + "<br>".join(parts)) if parts else str(cid)
+
+    df = df_in.copy()
+    df["__legend__"] = df[cluster_col].astype(str).map(legend_map).fillna(df[cluster_col].astype(str))
+    return df
 
 
 # --------------------
@@ -39,7 +194,7 @@ st.set_page_config(
     page_title="Cluster Labeler",
     layout="wide"
 )
-
+st.write("compute_data_id exists?", "compute_data_id" in globals())
 st.title("📚 Cluster Labeling & Enrichment")
 
 # --------------------
@@ -74,6 +229,10 @@ def load_data(file_bytes: bytes, filename: str):
 
 #    # ✅ Now this does what we actually want
 #    df = df.dropna(how="all")
+
+    # Initialize / reset persisted labels for this uploaded dataset
+    data_id = compute_data_id(file_bytes, uploaded_file.name)
+    init_label_store(data_id)
 
 #    return df
 
@@ -479,7 +638,8 @@ if uploaded_file is None:
 
 try:
     #df = load_data(uploaded_file)
-    df = load_data(uploaded_file.getvalue(), uploaded_file.name)
+    file_bytes = uploaded_file.getvalue()
+    df = load_data(file_bytes, uploaded_file.name)
 
     # ✅ Normalize Excel junk to real NA
     df = df.replace(
@@ -492,6 +652,10 @@ try:
 
     # ✅ Now this does what we actually want
     df = df.dropna(how="all")
+
+    # Initialize / reset persisted labels for this uploaded dataset
+    data_id = compute_data_id(file_bytes, uploaded_file.name)
+    init_label_store(data_id)
 
 except Exception as e:
     st.error(f"Error loading file: {e}")
@@ -521,13 +685,20 @@ st.sidebar.subheader("Hover columns (scatter)")
 
 # Default: show ONLY the cluster column in hover.
 # Allow user to add additional columns.
-hover_candidates = [c for c in all_columns if c not in {x_col, y_col}]
-default_extra_hover = []  # no extras by default
+# Persisted label columns (if you already ran a labeling strategy for this cluster column)
+persisted_label_cols = get_persisted_label_columns(cluster_col)
+if persisted_label_cols:
+    st.sidebar.caption("Available persisted labels: " + ", ".join(persisted_label_cols))
+
+# Extend hover candidates with persisted label columns
+hover_candidates = [c for c in list(dict.fromkeys(all_columns + persisted_label_cols)) if c not in {x_col, y_col}]
+default_extra_hover = [c for c in ["cTF-IDF keywords", "Summary label"] if c in hover_candidates]
 
 extra_hover_cols = st.sidebar.multiselect(
     "Show these columns in hover (in addition to cluster)",
     options=hover_candidates,
     default=default_extra_hover,
+    key="extra_hover_cols",
     help="Tip: selecting many columns (or long text columns) can cause memory issues."
 )
 
@@ -538,6 +709,30 @@ if len(extra_hover_cols) > MAX_EXTRA_HOVER:
         f"Showing only the first {MAX_EXTRA_HOVER} extra hover columns to keep the plot responsive."
     )
     extra_hover_cols = extra_hover_cols[:MAX_EXTRA_HOVER]
+
+st.sidebar.divider()
+st.sidebar.subheader("Legend (scatter)")
+show_legend = st.sidebar.checkbox("Show legend", value=True, key="show_legend")
+use_enriched_legend = st.sidebar.checkbox(
+    "Use enriched legend labels (cluster + labels)",
+    value=True,
+    key="use_enriched_legend",
+    help="If labels exist, show cTF-IDF and/or GPT summary in legend entries."
+)
+legend_style = st.sidebar.selectbox(
+    "Legend label content",
+    options=["Cluster only", "Cluster + cTF-IDF", "Cluster + GPT summary", "Cluster + cTF-IDF + GPT summary"],
+    index=3,
+    key="legend_style"
+)
+legend_max_len = st.sidebar.slider(
+    "Max characters per label part (legend)",
+    min_value=20,
+    max_value=200,
+    value=80,
+    step=10,
+    key="legend_max_len"
+)
 
 # --------------------
 # Sidebar: Dynamic filters
@@ -604,16 +799,45 @@ with tabs[1]:
         if len(plot_df) > max_points:
             plot_df = plot_df.sample(n=int(max_points), random_state=42)
 
+        # Append persisted labeling outputs (if available) so they can be used in hover/legend
+        plot_df = enrich_df_with_labels(plot_df, cluster_col)
+
+        # Keep only hover columns that actually exist
+        hover_cols = [c for c in hover_cols if c in plot_df.columns]
+
+        # Build enriched legend labels (optional)
+        color_col = cluster_col
+        if use_enriched_legend and legend_style != "Cluster only":
+            if get_persisted_label_columns(cluster_col):
+                plot_df = add_enriched_legend_column(plot_df, cluster_col, legend_style, max_len=int(legend_max_len))
+                color_col = "__legend__"
+
         fig = px.scatter(
             plot_df,
             x=x_col,
             y=y_col,
-            color=cluster_col,
+            color=color_col,
             hover_data=hover_cols,
             render_mode="webgl",
         )
+        fig.update_layout(showlegend=bool(show_legend))
 
         st.plotly_chart(fig, use_container_width=True)
+
+# --------------------
+# Download buttons for the current 2D plot
+# --------------------
+        st.markdown("### Download plot")
+
+# 1) Always available: interactive HTML
+        html_bytes = fig.to_html(include_plotlyjs="cdn").encode("utf-8")
+        st.download_button(
+         label="⬇️ Download interactive plot (HTML)",
+         data=html_bytes,
+         file_name="cluster_scatter.html",
+         mime="text/html",
+        )
+
 
 
 # --------------------
@@ -700,6 +924,9 @@ with tabs[3]:
                 )
 
             st.session_state["ctfidf_keywords"] = keyword_map
+
+            # Persist for other tabs (hover/legend, exports, etc.)
+            store_ctfidf_labels(cluster_col, keyword_map)
 
         # ---- Display ----
         if "ctfidf_keywords" in st.session_state:
@@ -884,6 +1111,9 @@ with tabs[3]:
 
             labels_df = pd.DataFrame(rows)
             st.session_state["gpt_labels_df"] = labels_df
+
+            # Persist for other tabs (hover/legend, exports, etc.)
+            store_gpt_labels(cluster_col, labels_df)
             st.session_state["labels_out_df"] = labels_df
 
         # Display
