@@ -1,5 +1,21 @@
 ### Lucie's chatter with Lucie ###
 
+# this _guave is _fig with fixed wide export - fixed RowID thing
+
+### to do after fixing the wide export: 
+# 1. Fix the chat GPT subclusters - it seems to have broken. It puts the subclusters suddenly in the homogeneity/diveristy field 
+# 2. fix updating labels: when labeling run and rerun, the labels on 2D chart do not update until the following run - so they are always one run behind unless the user “Reselects” the “Legend label content” – then it updates
+# 3. cosmetic changes to UI :
+    # move flush button
+    # make the order of widgets more logical. Having the labeling strategy on top is confusing
+                # the first should be the unique id selection
+                # then x, y
+                # then cluster column
+                # Then the labeling strtegy, or maybe even after the hover etc things
+
+# 4. change color palette from the default plotly to something useful for millions of clusters
+
+
 ### starting from Dill version on GitHub ###
 
 
@@ -10,9 +26,6 @@
 ## strategy which was overengineered and didn't work AT ALL. 
 ### I forced him to use my old functions and code bits from my old Jupyter notebooks which now seems to work
 
-###  _apple version was a copy of copilots outputted stClusterProcessor_notebook_mode.py which was based on _garlic_patched.py
-
-### this _banana version is a copy of manually edited/patched version of copilot-outputted stClusterProcessor_apple_persist.py 
 ### which featured persisting labels
 #### 
 ### the only new feature in _banana as compared to stClusterProcessor_apple_persist.py
@@ -50,8 +63,7 @@ except Exception:  # pragma: no cover
     OpenAI = None
 
 
-#st.write("compute_data_id exists?", "compute_data_id" in globals())
-
+#
 import hashlib
 
 # --------------------
@@ -67,11 +79,156 @@ def compute_data_id(file_bytes: bytes, filename: str) -> str:
     h.update(sample)
     return h.hexdigest()
 
+
+def make_empty_labels_registry() -> pd.DataFrame:
+    """Create an empty cluster-level label registry.
+
+    One row per (cluster_col, Cluster). Latest-overwrites per method.
+    """
+    cols = [
+        "cluster_col",
+        "Cluster",
+        "cTF-IDF keywords",
+        "Summary label",
+        "Keywords",
+        "Homogeneity/Diversity",
+        "Subclusters",
+        "ctfidf_last_updated",
+        "gpt_last_updated",
+        "gpt_n_docs_used",
+        "gpt_error",
+    ]
+    return pd.DataFrame({c: pd.Series(dtype="string") for c in cols})
+
+
+def upsert_labels_registry(cluster_col: str, labels_df: pd.DataFrame, method: str, ts: str = ""):
+    """Upsert cluster-level labels into the global registry.
+
+    method: 'ctfidf' or 'gpt'
+    ts: timestamp string (UTC) to store for the updated method
+    """
+    if labels_df is None or labels_df.empty or "Cluster" not in labels_df.columns:
+        return
+
+    # Ensure registry exists
+    if "labels_registry_df" not in st.session_state or st.session_state["labels_registry_df"] is None:
+        st.session_state["labels_registry_df"] = make_empty_labels_registry()
+
+    reg = st.session_state["labels_registry_df"].copy()
+
+    df_new = labels_df.copy()
+    df_new["cluster_col"] = str(cluster_col)
+    df_new["Cluster"] = df_new["Cluster"].astype(str)
+
+    # Keep only relevant columns per method
+    if method == "ctfidf":
+        keep = ["cluster_col", "Cluster", "cTF-IDF keywords"]
+        for c in keep:
+            if c not in df_new.columns:
+                df_new[c] = ""
+        df_new = df_new[keep]
+        df_new["ctfidf_last_updated"] = ts
+
+    elif method == "gpt":
+        keep = [
+            "cluster_col",
+            "Cluster",
+            "Summary label",
+            "Keywords",
+            "Homogeneity/Diversity",
+            "Subclusters",
+        ]
+        for c in keep:
+            if c not in df_new.columns:
+                df_new[c] = ""
+        df_new = df_new[keep]
+        df_new["gpt_last_updated"] = ts
+        # Optional extra columns if present
+        if "n_docs_used" in labels_df.columns:
+            df_new["gpt_n_docs_used"] = labels_df["n_docs_used"].astype("string")
+        if "error" in labels_df.columns:
+            df_new["gpt_error"] = labels_df["error"].astype("string")
+
+    else:
+        return
+
+    # Normalize dtypes
+    for c in df_new.columns:
+        df_new[c] = df_new[c].astype("string")
+
+    # Upsert by index (cluster_col, Cluster)
+    reg["cluster_col"] = reg["cluster_col"].astype("string")
+    reg["Cluster"] = reg["Cluster"].astype("string")
+
+    reg_idx = reg.set_index(["cluster_col", "Cluster"], drop=False)
+    new_idx = df_new.set_index(["cluster_col", "Cluster"], drop=False)
+
+    # Ensure all columns exist
+    for c in new_idx.columns:
+        if c not in reg_idx.columns:
+            reg_idx[c] = pd.Series(dtype="string")
+
+    # Update existing rows
+    common = reg_idx.index.intersection(new_idx.index)
+    if len(common):
+        reg_idx.loc[common, new_idx.columns] = new_idx.loc[common, new_idx.columns]
+
+    # Append new rows
+    missing = new_idx.index.difference(reg_idx.index)
+    if len(missing):
+        reg_idx = pd.concat([reg_idx, new_idx.loc[missing]], axis=0)
+
+    # Re-store
+    st.session_state["labels_registry_df"] = reg_idx.reset_index(drop=True)
+
+
+def labels_registry_summary() -> pd.DataFrame:
+    """Return a compact overview per clustering column."""
+    reg = st.session_state.get("labels_registry_df")
+    if reg is None or reg.empty:
+        return pd.DataFrame(columns=["cluster_col", "n_clusters", "has_ctfidf", "has_gpt", "ctfidf_last_updated", "gpt_last_updated"])
+
+    tmp = reg.copy()
+    #tmp["has_ctfidf"] = tmp["cTF-IDF keywords"].astype(str).str.len() > 0
+    #tmp["has_gpt"] = tmp["Summary label"].astype(str).str.len() > 0
+    def _has_text(s: pd.Series) -> pd.Series:
+        return (
+            s.fillna("")
+            .astype("string")
+            .replace({"<NA>": "", "nan": "", "None": ""})
+            .str.strip()
+            .str.len()
+            .gt(0)
+        )
+
+    tmp["has_ctfidf"] = _has_text(tmp["cTF-IDF keywords"])
+    tmp["has_gpt"] = _has_text(tmp["Summary label"])
+
+    def _max_ts(s):
+        s = s.dropna().astype(str)
+        s = s[s.str.len() > 0]
+        return s.max() if len(s) else ""
+
+    out = (
+        tmp.groupby("cluster_col", dropna=False)
+        .agg(
+            n_clusters=("Cluster", "nunique"),
+            has_ctfidf=("has_ctfidf", "any"),
+            has_gpt=("has_gpt", "any"),
+            ctfidf_last_updated=("ctfidf_last_updated", _max_ts),
+            gpt_last_updated=("gpt_last_updated", _max_ts),
+        )
+        .reset_index()
+        .sort_values(["has_gpt", "has_ctfidf", "n_clusters"], ascending=[False, False, False])
+    )
+    return out
+
 def init_label_store(data_id: str):
-    """Initialize (or reset) label store if a new dataset is uploaded."""
+    """Initialize (or reset) label store + labels registry if a new dataset is uploaded."""
     store = st.session_state.get("label_store")
     if (store is None) or (store.get("data_id") != data_id):
-        st.session_state["label_store"] = {"data_id": data_id, "by_cluster_col": {}}
+        st.session_state["label_store"] = {"data_id": data_id, "by_cluster_col": {}, "meta": {}}
+        st.session_state["labels_registry_df"] = make_empty_labels_registry()
 
 def _ensure_cluster_bucket(cluster_col: str) -> dict:
     store = st.session_state.get("label_store", {})
@@ -194,7 +351,6 @@ st.set_page_config(
     page_title="Cluster Labeler",
     layout="wide"
 )
-st.write("compute_data_id exists?", "compute_data_id" in globals())
 st.title("📚 Cluster Labeling & Enrichment")
 
 # --------------------
@@ -230,11 +386,6 @@ def load_data(file_bytes: bytes, filename: str):
 #    # ✅ Now this does what we actually want
 #    df = df.dropna(how="all")
 
-    # Initialize / reset persisted labels for this uploaded dataset
-    data_id = compute_data_id(file_bytes, uploaded_file.name)
-    init_label_store(data_id)
-
-#    return df
 
 
 
@@ -584,6 +735,51 @@ def build_cluster_text_samples(df, cluster_col, text_cols, max_docs_per_cluster=
         cluster_to_texts[cid] = texts
 
     return cluster_to_texts, size_df
+
+
+# --------------------
+# Document key helpers
+# --------------------
+
+def guess_document_key(columns: list) -> str:
+    """Heuristic default for a document identifier column."""
+    if not columns:
+        return "<none>"
+
+    prefs = [
+        "doi",
+        "paper_id",
+        "openalex_id",
+        "pmid",
+        "pmcid",
+        "ut",
+        "wos",
+        "id",
+    ]
+    low = {c.lower(): c for c in columns}
+    for p in prefs:
+        if p in low:
+            return low[p]
+    return "<none>"
+
+
+def describe_key_quality(df: pd.DataFrame, key_col: str) -> dict:
+    """Return basic missing/duplicate stats for a chosen key column (informational only)."""
+    if key_col is None or key_col == "<none>" or key_col not in df.columns:
+        return {"missing": None, "duplicates": None, "unique": None}
+
+    s = df[key_col]
+    # Missing: NA + empty/whitespace strings
+    s_str = s.astype(str)
+    missing = int(s.isna().sum()) + int((s_str.str.strip() == "").sum())
+
+    # Duplicates among non-empty values
+    s2 = s_str.str.strip()
+    s2 = s2[s2 != ""]
+    duplicates = int(s2.duplicated().sum())
+    unique = int(s2.nunique())
+    return {"missing": missing, "duplicates": duplicates, "unique": unique}
+
 # --------------------
 # Sidebar
 # --------------------
@@ -657,11 +853,59 @@ try:
     data_id = compute_data_id(file_bytes, uploaded_file.name)
     init_label_store(data_id)
 
+    # Create stable per-row identifier (always)
+    # This is used for exports and to keep rows distinguishable even when DOI etc. repeat.
+    if "RowID" not in df.columns:
+        df = df.reset_index(drop=True)
+        df.insert(0, "RowID", pd.Series(range(1, len(df) + 1), dtype="int64"))
+    else:
+        # If the input already has a RowID column, keep it and also create a safe internal one if needed
+        if df["RowID"].isna().any() or df["RowID"].duplicated().any():
+            df = df.reset_index(drop=True)
+            df.insert(0, "RowID_app", pd.Series(range(1, len(df) + 1), dtype="int64"))
+
 except Exception as e:
     st.error(f"Error loading file: {e}")
     st.stop()
 
 all_columns = df.columns.tolist()
+
+
+# --------------------
+# Sidebar: document key (semantic ID)
+# --------------------
+# RowID (or RowID_app) is always used as the stable per-row identifier.
+# The user-selected document key is optional and may contain duplicates (e.g., WoS category expansions).
+
+st.sidebar.divider()
+st.sidebar.subheader("Document key")
+
+# Default suggestion (once per uploaded dataset)
+_current_data_id = st.session_state.get("label_store", {}).get("data_id")
+if st.session_state.get("doc_key_data_id") != _current_data_id:
+    st.session_state["doc_key_data_id"] = _current_data_id
+    st.session_state["doc_key_col"] = guess_document_key([c for c in all_columns if c not in ["RowID", "RowID_app"]])
+
+_doc_key_options = ["<none>"] + [c for c in all_columns if c not in ["RowID", "RowID_app"]]
+_doc_key_default = st.session_state.get("doc_key_col", "<none>")
+if _doc_key_default not in _doc_key_options:
+    _doc_key_default = "<none>"
+
+doc_key_col = st.sidebar.selectbox(
+    "Document key column (optional)",
+    options=_doc_key_options,
+    index=_doc_key_options.index(_doc_key_default),
+    key="doc_key_col",
+    help="Optional semantic identifier (e.g., DOI). May contain duplicates; RowID is used as the stable row identifier."
+)
+
+q = describe_key_quality(df, doc_key_col)
+if doc_key_col != "<none>":
+    st.sidebar.caption(
+        f"Key quality — missing: {q['missing']:,} | duplicates: {q['duplicates']:,} | unique (non-empty): {q['unique']:,}"
+    )
+else:
+    st.sidebar.caption("No document key selected. RowID will be used for exports and row identity.")
 
 # --------------------
 # Sidebar: cluster + coords
@@ -698,7 +942,7 @@ extra_hover_cols = st.sidebar.multiselect(
     "Show these columns in hover (in addition to cluster)",
     options=hover_candidates,
     default=default_extra_hover,
-    key="extra_hover_cols",
+    key=f"extra_hover_cols__{cluster_col}",
     help="Tip: selecting many columns (or long text columns) can cause memory issues."
 )
 
@@ -712,18 +956,18 @@ if len(extra_hover_cols) > MAX_EXTRA_HOVER:
 
 st.sidebar.divider()
 st.sidebar.subheader("Legend (scatter)")
-show_legend = st.sidebar.checkbox("Show legend", value=True, key="show_legend")
+show_legend = st.sidebar.checkbox("Show legend", value=True, key=f"show_legend__{cluster_col}")
 use_enriched_legend = st.sidebar.checkbox(
     "Use enriched legend labels (cluster + labels)",
     value=True,
-    key="use_enriched_legend",
+    key=f"use_enriched_legend__{cluster_col}",
     help="If labels exist, show cTF-IDF and/or GPT summary in legend entries."
 )
 legend_style = st.sidebar.selectbox(
     "Legend label content",
     options=["Cluster only", "Cluster + cTF-IDF", "Cluster + GPT summary", "Cluster + cTF-IDF + GPT summary"],
     index=3,
-    key="legend_style"
+    key=f"legend_style__{cluster_col}"
 )
 legend_max_len = st.sidebar.slider(
     "Max characters per label part (legend)",
@@ -731,7 +975,7 @@ legend_max_len = st.sidebar.slider(
     max_value=200,
     value=80,
     step=10,
-    key="legend_max_len"
+    key=f"legend_max_len__{cluster_col}"
 )
 
 # --------------------
@@ -865,6 +1109,66 @@ with tabs[2]:
 with tabs[3]:
 
     st.subheader("Labeling results")
+    # --- Persistence / overwrite note + timestamps (Labeling Results tab only) ---
+    st.info(
+        "ℹ️ **Persistence note:** The app keeps only the **latest** results per **clustering column and labeling method**. "
+        "Re-running **cTF-IDF** overwrites the previous cTF-IDF labels for the selected clustering column; "
+        "re-running **GPT** overwrites the previous GPT labels for that clustering column. "
+        "If you want to keep snapshots for later reference, please **download/export** the labels after each run."
+    )
+
+    # Placeholder for last-updated line (lets us refresh it within the same run)
+    last_updated_placeholder = st.empty()
+
+    def render_last_updated():
+        _meta = (
+            st.session_state
+            .get("label_store", {})
+            .get("meta", {})
+            .get(cluster_col, {})
+        )
+
+        if not _meta:
+            last_updated_placeholder.caption(
+                "No labels have been generated yet for the selected clustering column."
+            )
+            return
+
+        parts = []
+        if _meta.get("ctfidf_last_updated"):
+            parts.append(f"**cTF-IDF last updated:** {_meta['ctfidf_last_updated']}")
+        if _meta.get("gpt_last_updated"):
+            parts.append(f"**GPT last updated:** {_meta['gpt_last_updated']}")
+
+        if parts:
+            last_updated_placeholder.caption(" | ".join(parts))
+        else:
+            last_updated_placeholder.caption(
+                "No labels have been generated yet for the selected clustering column."
+            )
+
+    # Initial render (current state)
+    render_last_updated()
+
+    with st.expander("📌 Label coverage across clustering columns", expanded=False):
+        summary_df = labels_registry_summary()
+        if summary_df is None or summary_df.empty:
+            st.caption("No cluster-level labels stored yet.")
+        else:
+            st.dataframe(summary_df, use_container_width=True, height=220)
+            st.caption("Tip: switch the **Cluster column** in the sidebar to view/use the stored labels for that clustering.")
+
+    with st.expander("🗃️ Label registry (all stored cluster-level labels)", expanded=False):
+        reg_df = st.session_state.get("labels_registry_df")
+        if reg_df is None or reg_df.empty:
+            st.caption("No labels in registry yet.")
+        else:
+            cols_to_show = [c for c in reg_df.columns if c not in []]
+            st.dataframe(reg_df[cols_to_show], use_container_width=True, height=320)
+            st.caption("This table accumulates results for multiple clustering columns. Latest-overwrites apply per method.")
+
+
+    ### deleted
 
     # ========== Strategy: cTF-IDF ==========
     if labeling_strategy == "cTF-IDF":
@@ -928,6 +1232,22 @@ with tabs[3]:
             # Persist for other tabs (hover/legend, exports, etc.)
             store_ctfidf_labels(cluster_col, keyword_map)
 
+            # Record last-updated timestamp for this cluster_col (latest overwrites behavior)
+            from datetime import datetime, timezone
+            ts_ct = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            st.session_state["label_store"].setdefault("meta", {})
+            st.session_state["label_store"]["meta"].setdefault(cluster_col, {})
+            st.session_state["label_store"]["meta"][cluster_col]["ctfidf_last_updated"] = ts_ct
+            render_last_updated()
+
+            # Update global labels registry (multi-cluster-column support)
+            ctfidf_df = (
+                pd.DataFrame.from_dict(keyword_map, orient="index", columns=["cTF-IDF keywords"])
+                .reset_index()
+                .rename(columns={"index": "Cluster"})
+            )
+            upsert_labels_registry(cluster_col, ctfidf_df, method="ctfidf", ts=ts_ct)
+
         # ---- Display ----
         if "ctfidf_keywords" in st.session_state:
             out_df = (
@@ -981,11 +1301,16 @@ with tabs[3]:
         with colC:
             docs_per_cluster = st.number_input(
                 "Docs per cluster (sample)",
-                min_value=10,
+                min_value=1,
                 max_value=200,
                 value=25,
-                step=5
+                step=1
             )
+
+            
+            if docs_per_cluster < 10:
+                st.caption("Tip: Label quality depends on the sample size. Small samples may overemphasize individual documents and produce skewed or underrepresentative labels.")
+
 
         st.session_state["openai_model"] = model
 
@@ -1051,14 +1376,18 @@ with tabs[3]:
             client = OpenAI(api_key=api_key)
 
             rows = []
-            progress = st.progress(0)
-            status = st.empty()
+
+            # Stable placeholders (prevents jitter/shaking of the results table)
+            status_ph = st.empty()
+            progress_ph = st.empty()
+            progress = progress_ph.progress(0)
+
 
             cluster_items = list(cluster_to_texts.items())
             n_total = len(cluster_items)
 
             for i, (cid, texts) in enumerate(cluster_items, start=1):
-                status.write(f"Cluster {cid} ({i}/{n_total})")
+                status_ph.write(f"Cluster {cid} ({i}/{n_total})")
 
                 # Safety: if a cluster has no usable text, keep empty label
                 if not texts:
@@ -1114,12 +1443,29 @@ with tabs[3]:
 
             # Persist for other tabs (hover/legend, exports, etc.)
             store_gpt_labels(cluster_col, labels_df)
+
+            # Record last-updated timestamp for this cluster_col (latest overwrites behavior)
+            from datetime import datetime, timezone
+            ts_gpt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            st.session_state["label_store"].setdefault("meta", {})
+            st.session_state["label_store"]["meta"].setdefault(cluster_col, {})
+            st.session_state["label_store"]["meta"][cluster_col]["gpt_last_updated"] = ts_gpt
+            render_last_updated()
+
+            # Update global labels registry (multi-cluster-column support)
+            upsert_labels_registry(cluster_col, labels_df, method="gpt", ts=ts_gpt)
+
+            # Clear progress/status placeholders now that labeling is finished
+            status_ph.empty()
+            progress_ph.empty()
+            
             st.session_state["labels_out_df"] = labels_df
 
         # Display
         if "gpt_labels_df" in st.session_state:
             st.success("GPT labeling completed.")
-            st.dataframe(st.session_state["gpt_labels_df"], use_container_width=True)
+            #st.dataframe(st.session_state["gpt_labels_df"], use_container_width=True)
+            st.dataframe(st.session_state["gpt_labels_df"], use_container_width=True, height=320)
 
             n_err = (st.session_state["gpt_labels_df"]["error"].astype(str).str.len() > 0).sum()
             if n_err:
@@ -1142,6 +1488,158 @@ with tabs[4]:
 # --------------------
 with tabs[5]:
     st.subheader("Exports")
+
+    # --------------------
+    # Wide export (document-level snapshot)
+    # --------------------
+    st.markdown("### Wide export (document-level snapshot)")
+    st.caption(
+        "Creates a document-level table with selected metadata + clustering columns + mapped label columns. "
+        "Rows are sorted by **RowID** to match the original upload order (Excel-friendly paste-next-to workflow)."
+    )
+
+    # Decide stable row id column
+    _row_id_col = "RowID" if "RowID" in df.columns else ("RowID_app" if "RowID_app" in df.columns else None)
+
+    # Base columns (default: RowID + DocumentKey if selected)
+    _default_base = [c for c in ["RowID", (doc_key_col if 'doc_key_col' in globals() else st.session_state.get('doc_key_col', '<none>'))] if c and c != "<none>" and c in df.columns]
+    if "RowID" in df.columns and "RowID" not in _default_base:
+        _default_base = ["RowID"] + _default_base
+    if not _default_base and _row_id_col is not None:
+        _default_base = [_row_id_col]
+
+    base_cols = st.multiselect(
+        "Base columns to include",
+        options=[c for c in df.columns],
+        default=_default_base,
+        help="Tip: keep this small if you plan to paste new columns next to your original table."
+    )
+
+    # Clustering columns selection
+    store_cols = list(st.session_state.get("label_store", {}).get("by_cluster_col", {}).keys())
+    # Heuristic candidates from df columns
+    import re as _re
+    cand_cols = [c for c in df.columns if _re.search(r"cluster|labels|eps", str(c), flags=_re.IGNORECASE)]
+    cand_cols = list(dict.fromkeys(store_cols + cand_cols))
+
+    mode = st.radio(
+        "Which clustering columns to include?",
+        options=[
+            "Only clustering columns with stored labels (recommended)",
+            "Choose manually",
+            "All candidate clustering columns from file",
+        ],
+        index=0,
+        horizontal=False,
+    )
+
+    if mode == "Only clustering columns with stored labels (recommended)":
+        cluster_cols_sel = store_cols
+        st.caption(f"Including {len(cluster_cols_sel)} clustering columns (those with stored labels).")
+    elif mode == "All candidate clustering columns from file":
+        cluster_cols_sel = cand_cols
+        st.caption(f"Including {len(cluster_cols_sel)} clustering-like columns detected from the file.")
+    else:
+        cluster_cols_sel = st.multiselect(
+            "Select clustering columns",
+            options=cand_cols if cand_cols else list(df.columns),
+            default=store_cols if store_cols else [],
+        )
+
+    # Label fields to append
+    st.markdown("**Label columns to append (per clustering column)**")
+    colA, colB, colC = st.columns(3)
+    with colA:
+        add_ctfidf = st.checkbox("cTF-IDF keywords", value=True)
+        add_gpt_summary = st.checkbox("GPT summary", value=True)
+    with colB:
+        add_gpt_keywords = st.checkbox("GPT keywords", value=False)
+        add_gpt_homogeneity = st.checkbox("GPT homogeneity", value=False)
+    with colC:
+        add_gpt_subclusters = st.checkbox("GPT subclusters", value=False)
+
+    preserve_order = st.checkbox("Preserve input row order (sort by RowID)", value=True)
+
+    # Build wide export dataframe
+    if st.button("Build wide export table"):
+        if _row_id_col is None:
+            st.error("RowID column not found. Please reload the file so RowID can be created.")
+        else:
+            # Start from full df (not filtered) to preserve upload order
+            cols_needed = list(dict.fromkeys([c for c in base_cols if c in df.columns] + [c for c in cluster_cols_sel if c in df.columns]))
+            wide_df = df[cols_needed].copy()
+
+            store = st.session_state.get("label_store", {})
+            by_cc = store.get("by_cluster_col", {})
+
+            for cc in cluster_cols_sel:
+                if cc not in df.columns:
+                    continue
+                bucket = by_cc.get(cc, {})
+                cid = df[cc].astype(str)
+
+                if add_ctfidf:
+                    m = bucket.get("ctfidf", {})
+                    wide_df[f"{cc}_cTF-IDF"] = cid.map(m).fillna("")
+
+                if add_gpt_summary:
+                    m = bucket.get("gpt_summary", {})
+                    wide_df[f"{cc}_chatGPT_summary"] = cid.map(m).fillna("")
+
+                if add_gpt_keywords:
+                    m = bucket.get("gpt_keywords", {})
+                    wide_df[f"{cc}_chatGPT_keywords"] = cid.map(m).fillna("")
+
+                if add_gpt_homogeneity:
+                    m = bucket.get("gpt_homogeneity", {})
+                    wide_df[f"{cc}_chatGPT_homogeneity"] = cid.map(m).fillna("")
+
+                if add_gpt_subclusters:
+                    m = bucket.get("gpt_subclusters", {})
+                    wide_df[f"{cc}_chatGPT_subclusters"] = cid.map(m).fillna("")
+
+            if preserve_order:
+                wide_df = wide_df.sort_values(by=_row_id_col, kind="mergesort")
+
+            st.session_state["wide_export_df"] = wide_df
+            st.success(f"Wide export table built: {len(wide_df):,} rows × {len(wide_df.columns)} columns")
+
+    if "wide_export_df" in st.session_state:
+        wide_df = st.session_state["wide_export_df"]
+        st.dataframe(wide_df.head(200), use_container_width=True, height=300)
+
+        csv_bytes = wide_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download wide export (CSV)",
+            data=csv_bytes,
+            file_name="wide_export.csv",
+            mime="text/csv",
+        )
+
+        towrite = io.BytesIO()
+        with pd.ExcelWriter(towrite, engine="openpyxl") as writer:
+            wide_df.to_excel(writer, index=False, sheet_name="wide_export")
+        st.download_button(
+            "Download wide export (XLSX)",
+            data=towrite.getvalue(),
+            file_name="wide_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    st.divider()
+
+
+    reg_df = st.session_state.get("labels_registry_df")
+    if reg_df is not None and not reg_df.empty:
+        st.markdown("### All stored labels (registry)")
+        st.dataframe(reg_df.head(300), use_container_width=True, height=300)
+        csv_all = reg_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download ALL labels registry (CSV)", data=csv_all, file_name="labels_registry.csv", mime="text/csv")
+        towrite_all = io.BytesIO()
+        with pd.ExcelWriter(towrite_all, engine="openpyxl") as writer:
+            reg_df.to_excel(writer, index=False, sheet_name="labels_registry")
+        st.download_button("Download ALL labels registry (XLSX)", data=towrite_all.getvalue(), file_name="labels_registry.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.divider()
 
     if "labels_out_df" not in st.session_state:
         st.info("Run a labeling strategy first. The resulting labels table will appear here for export.")
